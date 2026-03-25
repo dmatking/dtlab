@@ -270,6 +270,111 @@ def parse_epoch_to_utc(series: pd.Series, unit: str) -> Tuple[pd.Series, Dict]:
     return dt, meta
 
 
+# ---------- Split datetime+timezone column pairs ----------
+
+# Suffixes that indicate a companion timezone column
+_TZ_SUFFIXES = ["_tz", "_timezone", "_zone"]
+# Suffixes that indicate a datetime column
+_DT_SUFFIXES = ["_dt", "_date", "_time", "_ts", "_at", "_timestamp", "_datetime"]
+
+_IANA_RE = re.compile(r"^[A-Za-z_]+/[A-Za-z_/]+$")  # e.g. America/Chicago
+
+
+def _looks_like_tz_column(sample: List[str]) -> bool:
+    """Return True if most values look like IANA zone names or TZ abbreviations."""
+    if not sample:
+        return False
+    hits = sum(
+        bool(_IANA_RE.match(v) or v in TZ_ABBR_MAP or v in ("UTC", "GMT"))
+        for v in sample
+    )
+    return hits / len(sample) > 0.7
+
+
+def _detect_tz_pairs(df: pd.DataFrame, columns: List[str]) -> Dict[str, str]:
+    """
+    Find split datetime+timezone column pairs by name convention.
+    Returns {dt_col: tz_col} for each detected pair.
+
+    Looks for columns ending in a TZ suffix whose values look like IANA zone
+    names or TZ abbreviations, then searches for a companion datetime column
+    with the same prefix and a datetime suffix.
+    """
+    col_lower = {c: c.lower() for c in columns}
+    col_by_lower = {v: k for k, v in col_lower.items()}
+
+    pairs: Dict[str, str] = {}
+    for col in columns:
+        cl = col_lower[col]
+        for tz_suf in _TZ_SUFFIXES:
+            if not cl.endswith(tz_suf):
+                continue
+            prefix = cl[: -len(tz_suf)]
+            sample = df[col].dropna().astype(str).head(100).tolist()
+            if not _looks_like_tz_column(sample):
+                break
+            # Search for companion datetime column
+            for dt_suf in _DT_SUFFIXES:
+                companion_lower = prefix + dt_suf
+                companion = col_by_lower.get(companion_lower)
+                if companion and companion != col:
+                    pairs[companion] = col  # dt_col → tz_col
+                    break
+            break
+
+    return pairs
+
+
+def parse_dt_tz_pair_to_utc(
+    dt_series: pd.Series,
+    tz_series: pd.Series,
+    fallback_tz: Optional[str],
+) -> Tuple[pd.Series, Dict]:
+    """
+    Combine a naive datetime column with a per-row timezone column into UTC.
+    Each row's timezone is read from tz_series (IANA name or abbreviation).
+    """
+    meta: Dict = {"parser": "dateutil+per-row-tz", "naive_policy": "per-row tz column", "notes": []}
+    out = []
+    missing_tz = 0
+    bad_tz = 0
+
+    for dt_val, tz_val in zip(dt_series, tz_series):
+        dt_str = str(dt_val).strip() if pd.notna(dt_val) else ""
+        if not dt_str or not looks_like_date_string(dt_str):
+            out.append(pd.NaT)
+            continue
+        try:
+            dt = du_parser.parse(dt_str)
+        except (ValueError, OverflowError, AttributeError, TypeError):
+            out.append(pd.NaT)
+            continue
+
+        if dt.tzinfo is None:
+            tz_str = str(tz_val).strip() if pd.notna(tz_val) else None
+            if tz_str in ("", "nan", "None"):
+                tz_str = None
+            if tz_str:
+                tz_str = TZ_ABBR_MAP.get(tz_str, tz_str)
+                try:
+                    dt = dt.replace(tzinfo=ZoneInfo(tz_str))
+                except (KeyError, Exception):
+                    bad_tz += 1
+                    dt = dt.replace(tzinfo=ZoneInfo(fallback_tz or "UTC"))
+            else:
+                missing_tz += 1
+                dt = dt.replace(tzinfo=ZoneInfo(fallback_tz or "UTC"))
+
+        out.append(dt.astimezone(timezone.utc))
+
+    if missing_tz:
+        meta["notes"].append(f"missing_tz_rows={missing_tz} (used {fallback_tz or 'UTC'})")
+    if bad_tz:
+        meta["notes"].append(f"unrecognised_tz_rows={bad_tz} (used {fallback_tz or 'UTC'})")
+
+    return pd.to_datetime(pd.Series(out), utc=True, errors="coerce"), meta
+
+
 @dataclass
 class ColumnReport:
     name: str
@@ -298,7 +403,28 @@ def detect_date_columns(
         exclude_set = set(exclude_columns)
         columns = [c for c in columns if c not in exclude_set]
 
+    # Detect split datetime+timezone pairs (e.g. passing_dt / passing_tz)
+    tz_pairs = _detect_tz_pairs(df, columns)   # {dt_col: tz_col}
+    paired_tz_cols = set(tz_pairs.values())
+
+    # Handle paired columns first
+    for dt_col, tz_col in tz_pairs.items():
+        utc_series, meta = parse_dt_tz_pair_to_utc(df[dt_col], df[tz_col], naive_tz)
+        parse_rate = float(utc_series.notna().mean())
+        reports[dt_col] = ColumnReport(
+            name=dt_col, role="date_string", parse_rate=parse_rate,
+            parser=meta["parser"], naive_policy=meta["naive_policy"],
+            format_guess="", notes=[f"tz from {tz_col}"] + meta["notes"],
+        )
+        reports[tz_col] = ColumnReport(
+            name=tz_col, role="tz_column", parse_rate=0.0,
+            notes=[f"paired with {dt_col}"],
+        )
+        parsed_utc[dt_col] = utc_series
+
     for col in columns:
+        if col in tz_pairs or col in paired_tz_cols:
+            continue  # already handled above
         s = df[col]
         name_l = col.lower()
         name_hint = any(hint in name_l for hint in CANDIDATE_NAME_HINTS)

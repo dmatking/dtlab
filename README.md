@@ -99,6 +99,21 @@ All detected columns are normalized to UTC. Two columns are considered equivalen
 
 Grouping uses union-find, so transitivity is handled correctly (if A≡B and B≡C, all three end up in the same group).
 
+## Split datetime + timezone column pairs
+
+A common pattern in messy tables is a naive datetime column paired with a separate timezone column:
+
+| passing_dt          | passing_tz         |
+|---------------------|--------------------|
+| 2025-03-09 07:00:00 | America/Chicago    |
+| 2025-03-09 08:15:00 | America/New_York   |
+
+dtlab detects these pairs automatically by name convention. It looks for columns ending in `_tz` / `_timezone` / `_zone` whose values look like IANA zone names or TZ abbreviations, then searches for a companion column with the same prefix and a datetime suffix (`_dt`, `_date`, `_time`, `_ts`, `_at`).
+
+When a pair is found, the two columns are combined row-wise (each row gets its own timezone applied) before UTC normalization. The timezone column appears in the report with `role=tz_column` and is excluded from equivalence grouping.
+
+If the timezone column has null values for some rows, those rows fall back to `--naive-tz` (or UTC if not set).
+
 ## Caveats
 
 - **Naive timestamps**: without `--naive-tz`, naive strings are assumed to be UTC. If your data has naive local times, set `--naive-tz` to get correct grouping.
